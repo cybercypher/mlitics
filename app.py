@@ -1,41 +1,43 @@
 from flask import Flask, request, jsonify
 import requests
-from concurrent.futures import ThreadPoolExecutor
 import logging
-from marshmallow import Schema, fields, ValidationError
+import os
 
 # Flask app initialization
 app = Flask(__name__)
-
-# Thread pool for concurrent requests
-executor = ThreadPoolExecutor(max_workers=5)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Utility function to get headers
-def get_headers(api_key):
-    return {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-# Utility function to extract API key from request
-def get_api_key():
-    return request.args.get("api_key") or request.headers.get("Authorization")
+# Utility function to extract token from the request
+def get_token():
+    token = request.args.get("api_key")
+    if not token:
+        secret_path = "/run/secrets/mentionlytics_token"
+        if os.path.exists(secret_path):
+            with open(secret_path, "r") as secret_file:
+                token = secret_file.read().strip()
+    return token
 
 # Generic function to make API requests
-def make_request(method, endpoint, api_key, params=None, data=None):
+def make_request(method, endpoint, token, params=None, data=None):
     url = f"https://app.mentionlytics.com/api/{endpoint}"
     params = params or {}
-    params['token'] = api_key
+    params['token'] = token
+
+    # Ensure data is forwarded as None if not provided
+    data = data if data else None
 
     logger.info(f"Making {method} request to {url} with params: {params} and data: {data}")
 
     try:
         response = requests.request(
-            method=method, url=url, headers=get_headers(api_key), params=params, json=data
+            method=method,
+            url=url,
+            headers={"Content-Type": "application/json"},  # Only forward Content-Type
+            params=params,
+            json=data,
         )
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
@@ -46,93 +48,23 @@ def make_request(method, endpoint, api_key, params=None, data=None):
         logger.error(f"Request error: {response.status_code} - {response.text}")
         return {"error": response.json().get("message", "Unknown error")}, response.status_code
 
-    logger.info(f"Response: {response.status_code}, {response.text}")
     return response.json()
 
-# Input validation schema for creating an alert
-class AlertSchema(Schema):
-    project_id = fields.Str(required=True)
-    name = fields.Str(required=True)
-    keywords = fields.List(fields.Str(), required=True)
-
-# Route to get mentions by keyword
-@app.route("/mentions", methods=["GET"])
-def get_mentions():
-    api_key = get_api_key()
-    if not api_key:
+# Catch-all route to forward all requests
+@app.route("/<path:endpoint>", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+def proxy_request(endpoint):
+    token = get_token()
+    if not token:
         return jsonify({"error": "API key is required"}), 401
 
-    keyword = request.args.get("keyword")
-    project_id = request.args.get("project_id")
+    params = {key: value for key, value in request.args.items() if key != "api_key"}
+    data = request.get_json() if request.is_json else None
 
-    if not keyword or not project_id:
-        return jsonify({"error": "keyword and project_id are required"}), 400
+    # Replace 'api_key' with 'token' in params
+    if "api_key" in params:
+        params["token"] = params.pop("api_key")
 
-    future = executor.submit(
-        make_request, "GET", "mentions", api_key, {"keyword": keyword, "project_id": project_id}
-    )
-    result = future.result()
-    return jsonify(result)
-
-# Route to create a new alert
-@app.route("/alerts", methods=["POST"])
-def create_alert():
-    api_key = get_api_key()
-    if not api_key:
-        return jsonify({"error": "API key is required"}), 401
-
-    data = request.json
-    try:
-        AlertSchema().load(data)
-    except ValidationError as err:
-        return jsonify({"error": err.messages}), 400
-
-    future = executor.submit(
-        make_request,
-        "POST",
-        "alerts",
-        api_key,
-        None,
-        {"project_id": data["project_id"], "name": data["name"], "keywords": data["keywords"]},
-    )
-    result = future.result()
-    return jsonify(result)
-
-# Route to get all alerts for a project
-@app.route("/alerts", methods=["GET"])
-def get_alerts():
-    api_key = get_api_key()
-    if not api_key:
-        return jsonify({"error": "API key is required"}), 401
-
-    project_id = request.args.get("project_id")
-    if not project_id:
-        return jsonify({"error": "project_id is required"}), 400
-
-    future = executor.submit(make_request, "GET", "alerts", api_key, {"project_id": project_id})
-    result = future.result()
-    return jsonify(result)
-
-# Route to get all projects
-@app.route("/projects", methods=["GET"])
-def get_projects():
-    api_key = get_api_key()
-    if not api_key:
-        return jsonify({"error": "API key is required"}), 401
-
-    future = executor.submit(make_request, "GET", "projects", api_key)
-    result = future.result()
-    return jsonify(result)
-
-# Route to get metrics for a project
-@app.route("/projects/<project_id>/metrics", methods=["GET"])
-def get_project_metrics(project_id):
-    api_key = get_api_key()
-    if not api_key:
-        return jsonify({"error": "API key is required"}), 401
-
-    future = executor.submit(make_request, "GET", f"projects/{project_id}/metrics", api_key)
-    result = future.result()
+    result = make_request(request.method, endpoint, token, params, data)
     return jsonify(result)
 
 # Run the Flask app with multi-threading enabled
